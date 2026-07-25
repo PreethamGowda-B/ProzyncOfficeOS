@@ -3,6 +3,4 @@ node_modules/
 .env
 .env.local
 .env.production
-dist/
-.next/
 *.log
