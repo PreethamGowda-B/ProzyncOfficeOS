@@ -6,8 +6,8 @@
     "dev": "nest start --watch",
     "build": "nest build",
     "postinstall": "prisma generate",
-    "start": "node dist/main.js",
-    "start:prod": "node dist/main.js",
+    "start": "node dist/src/main.js",
+    "start:prod": "node dist/src/main.js",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "seed": "ts-node prisma/seed.ts"
