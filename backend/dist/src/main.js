@@ -16,16 +16,19 @@ async function bootstrap() {
             // Allow requests with no origin (mobile apps, curl, Postman)
             if (!origin)
                 return callback(null, true);
-            const allowedOrigin = process.env.WEB_APP_URL;
-            // In production: only allow the explicit WEB_APP_URL
-            if (process.env.NODE_ENV === "production") {
-                if (allowedOrigin && origin === allowedOrigin) {
-                    return callback(null, true);
-                }
-                return callback(new Error(`CORS blocked: ${origin}`), false);
-            }
-            // In development: allow any localhost or 127.0.0.1 port
+            const allowedOrigins = [
+                process.env.WEB_APP_URL,
+                "https://prozync-office-os.vercel.app",
+            ].filter(Boolean);
+            // Always allow localhost in any environment
             if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+                return callback(null, true);
+            }
+            // Allow any Vercel preview deployment for this project
+            if (/^https:\/\/prozync-office-os.*\.vercel\.app$/.test(origin)) {
+                return callback(null, true);
+            }
+            if (allowedOrigins.includes(origin)) {
                 return callback(null, true);
             }
             callback(new Error(`CORS blocked: ${origin}`), false);
