@@ -1,0 +1,1359 @@
+// ============================================================================
+// Prozync OfficeOS — Database Schema
+// PostgreSQL via Prisma ORM
+// See ARCHITECTURE.md for the reasoning behind these design choices.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// 0. COMPANY (settings + future multi-tenancy root)
+// ============================================================================
+// Today there is exactly one Company row (Prozync Innovations). Every root
+// aggregate below carries a companyId. That costs nothing while you're
+// single-tenant, but means "sell OfficeOS to other companies" later is a
+// feature flag + row-level scoping change, not a schema rewrite.
+
+model Company {
+  id                String   @id @default(cuid())
+  name              String
+  logoUrl           String?
+  theme             Json? // primary color, font, etc. consumed by the frontend
+  timezone          String   @default("Asia/Kolkata")
+  workingHoursStart String   @default("09:30") // "HH:mm", interpreted in `timezone`
+  workingHoursEnd   String   @default("18:30")
+  passwordPolicy    Json? // { minLength, requireSymbol, requireNumber, expiryDays, ... }
+  notificationDefaults Json? // default channel toggles per notification type
+
+  users            User[]
+  departments      Department[]
+  clients          Client[]
+  leads            Lead[]
+  deals            Deal[]
+  projects         Project[]
+  invoices         Invoice[]
+  expenses         Expense[]
+  holidays         Holiday[]
+  jobOpenings      JobOpening[]
+  emailTemplates   EmailTemplate[]
+  knowledgeBaseArticles KnowledgeBaseArticle[]
+  announcements    Announcement[]
+  chatChannels     ChatChannel[]
+  invitations      Invitation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum EmailTemplateKey {
+  INVITATION
+  OFFER_LETTER
+  LEAVE_APPROVED
+  LEAVE_REJECTED
+  INVOICE_SENT
+  PASSWORD_RESET
+  WELCOME
+}
+
+model EmailTemplate {
+  id        String           @id @default(cuid())
+  companyId String
+  company   Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  key       EmailTemplateKey
+  subject   String
+  bodyHtml  String
+  updatedAt DateTime         @updatedAt
+
+  @@unique([companyId, key])
+}
+
+// Invitation-based onboarding: Super Admin/HR creates the row below (no
+// password set yet) → system emails a secure link → employee sets their own
+// password within the expiry window. No temporary passwords are ever emailed.
+model Invitation {
+  id             String    @id @default(cuid())
+  companyId      String
+  company        Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  email          String
+  roleId         String
+  departmentId   String?
+  teamId         String?
+  invitedById    String
+  token          String    @unique
+  expiresAt      DateTime
+  acceptedAt     DateTime?
+  acceptedUserId String?   @unique
+  createdAt      DateTime  @default(now())
+}
+
+// ============================================================================
+// 1. AUTH, RBAC & CORE USER
+// ============================================================================
+
+enum RoleName {
+  SUPER_ADMIN
+  COMPANY_ADMIN
+  HR_MANAGER
+  PROJECT_MANAGER
+  TEAM_LEAD
+  DEVELOPER
+  UI_UX_DESIGNER
+  MOBILE_DEVELOPER
+  QA_ENGINEER
+  SALES_EXECUTIVE
+  BUSINESS_DEVELOPMENT
+  FINANCE
+  INTERN
+  CLIENT
+}
+
+model Role {
+  id          String           @id @default(cuid())
+  name        RoleName         @unique
+  description String?
+  users       User[]
+  permissions RolePermission[]
+  createdAt   DateTime         @default(now())
+}
+
+model Permission {
+  id          String                   @id @default(cuid())
+  key         String                   @unique // e.g. "project:create", "salary:view:all"
+  description String?
+  roles       RolePermission[]
+  overrides   UserPermissionOverride[]
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+}
+
+// Per-user allow/deny overrides on top of role defaults.
+model UserPermissionOverride {
+  id           String     @id @default(cuid())
+  userId       String
+  permissionId String
+  allow        Boolean // true = grant even if role lacks it, false = revoke even if role has it
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, permissionId])
+}
+
+enum EmploymentType {
+  FULL_TIME
+  PART_TIME
+  CONTRACT
+  INTERN
+  FREELANCE
+}
+
+// Post-hire lifecycle. Pre-hire stages (Applicant/Interview/Selected) live on
+// Candidate/JobOpening — a User row is only created once someone is hired
+// and their Invitation is accepted.
+enum UserStatus {
+  ONBOARDING
+  ACTIVE
+  PROBATION
+  ON_LEAVE
+  NOTICE_PERIOD
+  SUSPENDED
+  RESIGNED
+  TERMINATED
+}
+
+model User {
+  id             String         @id @default(cuid())
+  companyId      String
+  company        Company        @relation(fields: [companyId], references: [id])
+  email          String         @unique
+  passwordHash   String? // null until the user accepts their Invitation and sets one
+  fullName       String
+  displayName    String?
+  avatarUrl      String?
+  phone          String?
+  roleId         String
+  role           Role           @relation(fields: [roleId], references: [id])
+  departmentId   String?
+  department     Department?    @relation(fields: [departmentId], references: [id])
+  teamId         String?
+  team           Team?          @relation(fields: [teamId], references: [id])
+  employmentType EmploymentType?
+  status         UserStatus     @default(ACTIVE)
+  joiningDate    DateTime?
+  twoFactorSecret String?
+  twoFactorEnabled Boolean       @default(false)
+
+  // Relations
+  profile              EmployeeProfile?
+  permissionOverrides  UserPermissionOverride[]
+  sessions             Session[]
+  deviceLogins         DeviceLogin[]
+  auditLogs            AuditLog[]
+  assignedTasks        Task[]                  @relation("TaskAssignee")
+  createdTasks         Task[]                  @relation("TaskCreator")
+  taskComments         TaskComment[]
+  timeLogs             TimeLog[]
+  dailyUpdates         DailyUpdate[]
+  pointsLedgerEntries  PointsLedgerEntry[]
+  leaveRequests        LeaveRequest[]
+  leaveBalance         LeaveBalance?
+  managedProjects      Project[]               @relation("ProjectManager")
+  teamsLed             Team[]                  @relation("TeamLead")
+  ledgerAsClient       Client?                 @relation("ClientUser")
+  crmOwnedLeads        Lead[]
+  crmOwnedDeals        Deal[]
+  notifications        Notification[]
+  chatMessages         ChatMessage[]
+  meetingsOrganized    Meeting[]               @relation("MeetingOrganizer")
+  meetingAttendance    MeetingAttendee[]
+  documentsUploaded    Document[]              @relation("DocumentUploader")
+  equipmentIssued      Equipment[]
+  promotionHistory     PromotionRecord[]
+  salaryDetails        SalaryDetail[]
+  performanceReviews   PerformanceReview[]      @relation("ReviewSubject")
+  reviewsGiven         PerformanceReview[]      @relation("ReviewAuthor")
+  interviewsConducted  Interview[]              @relation("Interviewer")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshToken String   @unique
+  ipAddress    String?
+  userAgent    String?
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  createdAt    DateTime @default(now())
+}
+
+model DeviceLogin {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device    String?
+  ipAddress String?
+  location  String? // coarse, e.g. city-level from IP
+  loggedInAt DateTime @default(now())
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  LOGIN
+  LOGOUT
+  PERMISSION_CHANGE
+  EXPORT
+}
+
+model AuditLog {
+  id         String      @id @default(cuid())
+  userId     String?
+  user       User?       @relation(fields: [userId], references: [id])
+  action     AuditAction
+  entityType String // e.g. "Task", "Invoice"
+  entityId   String?
+  beforeValue Json? // entity snapshot prior to the change
+  afterValue  Json? // entity snapshot after the change
+  metadata   Json?
+  ipAddress  String?
+  userAgent  String? // raw UA string
+  browser    String? // parsed, e.g. "Chrome 126"
+  device     String? // parsed, e.g. "macOS / Desktop"
+  createdAt  DateTime    @default(now())
+}
+
+// ============================================================================
+// 2. DEPARTMENT & TEAM
+// ============================================================================
+
+model Department {
+  id          String       @id @default(cuid())
+  companyId   String
+  company     Company      @relation(fields: [companyId], references: [id])
+  name        String
+  users       User[]
+  jobOpenings JobOpening[]
+  createdAt   DateTime     @default(now())
+
+  @@unique([companyId, name])
+}
+
+model Team {
+  id        String    @id @default(cuid())
+  name      String
+  leadId    String?
+  lead      User?     @relation("TeamLead", fields: [leadId], references: [id])
+  members   User[]
+  projects  Project[]
+  createdAt DateTime  @default(now())
+}
+
+// ============================================================================
+// 3. EMPLOYEE MANAGEMENT
+// ============================================================================
+
+model EmployeeProfile {
+  id                String   @id @default(cuid())
+  userId            String   @unique
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  skills            String[] // simple tag list; can normalize later if needed
+  experienceYears   Float?
+  emergencyContactName  String?
+  emergencyContactPhone String?
+  emergencyContactRelation String?
+  bio               String?
+  updatedAt         DateTime @updatedAt
+}
+
+model Document {
+  id           String    @id @default(cuid())
+  ownerUserId  String? // employee doc owner, if applicable
+  clientId     String? // client doc owner, if applicable
+  client       Client?   @relation(fields: [clientId], references: [id])
+  uploadedById String
+  uploadedBy   User      @relation("DocumentUploader", fields: [uploadedById], references: [id])
+  fileName     String
+  storageKey   String // S3/R2 object key
+  fileType     String
+  fileSizeBytes Int?
+  visibility   String    @default("private") // private | team | company | client
+  category     String? // e.g. "offer_letter", "id_proof", "contract"
+  createdAt    DateTime  @default(now())
+}
+
+model Equipment {
+  id          String    @id @default(cuid())
+  assignedToId String
+  assignedTo  User      @relation(fields: [assignedToId], references: [id])
+  itemName    String
+  serialNumber String?
+  issuedDate  DateTime  @default(now())
+  returnedDate DateTime?
+  condition   String?
+  notes       String?
+}
+
+model SalaryDetail {
+  id             String   @id @default(cuid())
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  baseSalary     Decimal  @db.Decimal(12, 2)
+  currency       String   @default("INR")
+  bankAccountNumber String? // consider field-level encryption at app layer
+  bankName       String?
+  ifscCode       String?
+  effectiveFrom  DateTime
+  effectiveTo    DateTime?
+  createdAt      DateTime @default(now())
+}
+
+model PromotionRecord {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fromTitle   String
+  toTitle     String
+  effectiveDate DateTime
+  notes       String?
+  createdAt   DateTime @default(now())
+}
+
+model Certification {
+  id            String   @id @default(cuid())
+  userId        String
+  name          String
+  issuingBody   String?
+  issuedDate    DateTime?
+  expiryDate    DateTime?
+  credentialUrl String?
+}
+
+// ============================================================================
+// 4. RECRUITMENT
+// ============================================================================
+
+enum JobStatus {
+  OPEN
+  ON_HOLD
+  CLOSED
+}
+
+model JobOpening {
+  id           String       @id @default(cuid())
+  companyId    String
+  company      Company      @relation(fields: [companyId], references: [id])
+  title        String
+  departmentId String?
+  department   Department?  @relation(fields: [departmentId], references: [id])
+  description  String
+  status       JobStatus    @default(OPEN)
+  openings     Int          @default(1)
+  candidates   Candidate[]
+  createdAt    DateTime     @default(now())
+}
+
+enum CandidateStage {
+  APPLIED
+  SCREENING
+  INTERVIEW
+  OFFER
+  HIRED
+  REJECTED
+}
+
+model Candidate {
+  id           String          @id @default(cuid())
+  jobOpeningId String
+  jobOpening   JobOpening      @relation(fields: [jobOpeningId], references: [id])
+  fullName     String
+  email        String
+  phone        String?
+  resumeUrl    String?
+  stage        CandidateStage  @default(APPLIED)
+  interviews   Interview[]
+  offerLetter  OfferLetter?
+  onboarding   OnboardingChecklist?
+  createdAt    DateTime        @default(now())
+}
+
+model Interview {
+  id            String   @id @default(cuid())
+  candidateId   String
+  candidate     Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  interviewerId String
+  interviewer   User     @relation("Interviewer", fields: [interviewerId], references: [id])
+  scheduledAt   DateTime
+  feedback      String?
+  rating        Int? // 1-5
+  round         String? // e.g. "Technical Round 1"
+}
+
+model OfferLetter {
+  id          String    @id @default(cuid())
+  candidateId String    @unique
+  candidate   Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  storageKey  String
+  sentAt      DateTime?
+  acceptedAt  DateTime?
+  createdAt   DateTime  @default(now())
+}
+
+model OnboardingChecklist {
+  id          String    @id @default(cuid())
+  candidateId String    @unique
+  candidate   Candidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  items       Json // [{ label, completed, completedAt }]
+  completedAt DateTime?
+}
+
+// ============================================================================
+// 5. PROJECT & TASK MANAGEMENT
+// ============================================================================
+
+enum ProjectStatus {
+  DRAFT
+  PLANNING
+  DEVELOPMENT
+  TESTING
+  UAT
+  DEPLOYMENT
+  MAINTENANCE
+  COMPLETED
+  ON_HOLD
+  CANCELLED
+}
+
+model Project {
+  id           String         @id @default(cuid())
+  companyId    String
+  company      Company        @relation(fields: [companyId], references: [id])
+  name         String
+  clientId     String?
+  client       Client?        @relation(fields: [clientId], references: [id])
+  managerId    String
+  manager      User           @relation("ProjectManager", fields: [managerId], references: [id])
+  teamId       String?
+  team         Team?          @relation(fields: [teamId], references: [id])
+  status       ProjectStatus  @default(DRAFT)
+  startDate    DateTime?
+  endDate      DateTime?
+  budget       Decimal?       @db.Decimal(12, 2)
+  budgetSpent  Decimal?       @db.Decimal(12, 2)
+  description  String?
+  milestones   Milestone[]
+  sprints      Sprint[]
+  tasks        Task[]
+  risks        ProjectRisk[]
+  repositories Repository[]
+  invoices     Invoice[]
+  createdAt    DateTime       @default(now())
+}
+
+model Milestone {
+  id        String    @id @default(cuid())
+  projectId String
+  project   Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  title     String
+  dueDate   DateTime?
+  completedAt DateTime?
+  tasks     Task[]
+}
+
+model Sprint {
+  id        String   @id @default(cuid())
+  projectId String
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name      String
+  startDate DateTime
+  endDate   DateTime
+  tasks     Task[]
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  IN_REVIEW
+  QA
+  DONE
+  BLOCKED
+}
+
+enum QAStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  PASSED
+  FAILED
+}
+
+model Task {
+  id              String        @id @default(cuid())
+  projectId       String
+  project         Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  milestoneId     String?
+  milestone       Milestone?    @relation(fields: [milestoneId], references: [id])
+  sprintId        String?
+  sprint          Sprint?       @relation(fields: [sprintId], references: [id])
+  parentTaskId    String? // for subtasks
+  parentTask      Task?         @relation("Subtasks", fields: [parentTaskId], references: [id])
+  subtasks        Task[]        @relation("Subtasks")
+  title           String
+  description     String?
+  priority        TaskPriority  @default(MEDIUM)
+  status          TaskStatus    @default(TODO)
+  qaStatus        QAStatus?
+  assigneeId      String?
+  assignee        User?         @relation("TaskAssignee", fields: [assigneeId], references: [id])
+  creatorId       String
+  creator         User          @relation("TaskCreator", fields: [creatorId], references: [id])
+  dueDate         DateTime?
+  estimatedHours  Float?
+  actualHours     Float?
+  githubPrUrl     String?
+  deploymentLink  String?
+  dependsOn       TaskDependency[] @relation("DependentTask")
+  dependedOnBy    TaskDependency[] @relation("DependencyTask")
+  comments        TaskComment[]
+  attachments     TaskAttachment[]
+  timeLogs        TimeLog[]
+  activityEvents  ActivityEvent[]
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+}
+
+// Self-referential many-to-many for task dependencies
+model TaskDependency {
+  id              String @id @default(cuid())
+  dependentTaskId String // this task...
+  dependentTask   Task   @relation("DependentTask", fields: [dependentTaskId], references: [id], onDelete: Cascade)
+  dependsOnTaskId String // ...depends on this task
+  dependsOnTask   Task   @relation("DependencyTask", fields: [dependsOnTaskId], references: [id], onDelete: Cascade)
+
+  @@unique([dependentTaskId, dependsOnTaskId])
+}
+
+model TaskComment {
+  id        String   @id @default(cuid())
+  taskId    String
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  authorId  String
+  author    User     @relation(fields: [authorId], references: [id])
+  body      String
+  createdAt DateTime @default(now())
+}
+
+model TaskAttachment {
+  id         String   @id @default(cuid())
+  taskId     String
+  task       Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  fileName   String
+  storageKey String
+  uploadedAt DateTime @default(now())
+}
+
+model TimeLog {
+  id        String    @id @default(cuid())
+  taskId    String
+  task      Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User      @relation(fields: [userId], references: [id])
+  startedAt DateTime
+  endedAt   DateTime?
+  hours     Float?
+  notes     String?
+}
+
+model ActivityEvent {
+  id        String   @id @default(cuid())
+  taskId    String?
+  task      Task?    @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  projectId String?
+  eventType String // "status_change", "comment_added", "assigned", etc.
+  metadata  Json?
+  createdAt DateTime @default(now())
+}
+
+enum RiskSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+model ProjectRisk {
+  id          String       @id @default(cuid())
+  projectId   String
+  project     Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  title       String
+  description String?
+  severity    RiskSeverity @default(MEDIUM)
+  mitigation  String?
+  resolvedAt  DateTime?
+  createdAt   DateTime     @default(now())
+}
+
+// ============================================================================
+// 6. DAILY UPDATE & POINTS SYSTEM
+// ============================================================================
+
+model DailyUpdate {
+  id            String   @id @default(cuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  date          DateTime @db.Date
+  completedItems String[] // "Today I completed..."
+  plannedItems   String[] // "Tomorrow I will work on..."
+  createdAt     DateTime @default(now())
+
+  @@unique([userId, date])
+}
+
+enum PointReason {
+  DAILY_UPDATE_SUBMITTED
+  MISSED_UPDATE
+  TASK_COMPLETED
+  TASK_BEFORE_DEADLINE
+  BUG_FIXED
+  LATE_TASK
+  CLIENT_APPRECIATION
+  MISSED_MEETING
+  CODE_REVIEW_APPROVED
+  BUILD_FAILURE
+}
+
+// Append-only ledger. Point values per reason are configured in application
+// code (not hardcoded here) so they can be tuned without a migration.
+model PointsLedgerEntry {
+  id         String      @id @default(cuid())
+  userId     String
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  reason     PointReason
+  points     Int // signed value, e.g. +10 or -5
+  referenceType String? // "Task", "Meeting", etc.
+  referenceId   String?
+  note       String?
+  createdAt  DateTime    @default(now())
+}
+
+// Cached monthly rollup for fast dashboard/leaderboard reads.
+model MonthlyScore {
+  id        String   @id @default(cuid())
+  userId    String
+  year      Int
+  month     Int
+  totalPoints Int
+  rank      Int?
+  isTopPerformer Boolean @default(false)
+
+  @@unique([userId, year, month])
+}
+
+// ============================================================================
+// 7. GITHUB INTEGRATION
+// ============================================================================
+
+model Repository {
+  id            String   @id @default(cuid())
+  projectId     String?
+  project       Project? @relation(fields: [projectId], references: [id])
+  githubRepoId  String   @unique
+  fullName      String // "prozync/officeos-web"
+  defaultBranch String   @default("main")
+  pullRequests  PullRequest[]
+  commits       Commit[]
+  branches      Branch[]
+  deployments   Deployment[]
+  createdAt     DateTime @default(now())
+}
+
+enum PRStatus {
+  OPEN
+  MERGED
+  CLOSED
+}
+
+enum ReviewStatus {
+  PENDING
+  CHANGES_REQUESTED
+  APPROVED
+}
+
+model PullRequest {
+  id            String       @id @default(cuid())
+  repositoryId  String
+  repository    Repository   @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  githubPrNumber Int
+  title         String
+  authorGithubUsername String?
+  status        PRStatus     @default(OPEN)
+  reviewStatus  ReviewStatus @default(PENDING)
+  url           String
+  openedAt      DateTime
+  mergedAt      DateTime?
+  closedAt      DateTime?
+
+  @@unique([repositoryId, githubPrNumber])
+}
+
+model Commit {
+  id           String     @id @default(cuid())
+  repositoryId String
+  repository   Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  sha          String
+  message      String
+  authorGithubUsername String?
+  committedAt  DateTime
+
+  @@unique([repositoryId, sha])
+}
+
+model Branch {
+  id           String     @id @default(cuid())
+  repositoryId String
+  repository   Repository @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  name         String
+  isProtected  Boolean    @default(false)
+
+  @@unique([repositoryId, name])
+}
+
+enum DeploymentStatus {
+  PENDING
+  SUCCESS
+  FAILURE
+  ROLLED_BACK
+}
+
+model Deployment {
+  id           String           @id @default(cuid())
+  repositoryId String
+  repository   Repository       @relation(fields: [repositoryId], references: [id], onDelete: Cascade)
+  environment  String // "staging" | "production"
+  status       DeploymentStatus @default(PENDING)
+  url          String?
+  buildLogs    BuildLog[]
+  deployedAt   DateTime         @default(now())
+}
+
+model BuildLog {
+  id           String     @id @default(cuid())
+  deploymentId String
+  deployment   Deployment @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+  logUrl       String?
+  status       DeploymentStatus
+  createdAt    DateTime   @default(now())
+}
+
+// ============================================================================
+// 8. CLIENT PORTAL
+// ============================================================================
+
+// Client-side pipeline. Pure leads (not yet a client at all) live in Lead
+// below; once a Lead converts, a Client row is created starting at PROSPECT.
+enum ClientStage {
+  PROSPECT
+  ACTIVE
+  ARCHIVED
+}
+
+model Client {
+  id          String     @id @default(cuid())
+  companyId   String
+  company     Company    @relation(fields: [companyId], references: [id])
+  companyName String
+  stage       ClientStage @default(PROSPECT)
+  userId      String?    @unique // linked login account, if they have portal access
+  user        User?      @relation("ClientUser", fields: [userId], references: [id])
+  contactEmail String
+  contactPhone String?
+  projects    Project[]
+  documents   Document[]
+  tickets     Ticket[]
+  invoices    Invoice[]
+  deals       Deal[]
+  chatMessages ChatMessage[]
+  createdAt   DateTime   @default(now())
+  archivedAt  DateTime?
+}
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+  CLOSED
+}
+
+model Ticket {
+  id          String       @id @default(cuid())
+  clientId    String
+  client      Client       @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  subject     String
+  description String
+  status      TicketStatus @default(OPEN)
+  createdAt   DateTime     @default(now())
+  resolvedAt  DateTime?
+}
+
+model Deliverable {
+  id          String    @id @default(cuid())
+  projectId   String
+  title       String
+  storageKey  String
+  approvedAt  DateTime?
+  approvedByClientUserId String?
+  submittedAt DateTime  @default(now())
+}
+
+// ============================================================================
+// 9. CRM
+// ============================================================================
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  QUALIFIED
+  DISQUALIFIED
+  CONVERTED
+}
+
+model Lead {
+  id          String     @id @default(cuid())
+  companyId   String // Prozync's own company id (multi-tenancy), not the prospect's company
+  company     Company    @relation(fields: [companyId], references: [id])
+  companyName String? // the prospect's company name
+  contactName String
+  email       String?
+  phone       String?
+  source      String? // "referral", "website", "cold outreach"
+  status      LeadStatus @default(NEW)
+  ownerId     String
+  owner       User       @relation(fields: [ownerId], references: [id])
+  followUps   FollowUp[]
+  deal        Deal?
+  createdAt   DateTime   @default(now())
+}
+
+enum DealStage {
+  PROSPECTING
+  PROPOSAL_SENT
+  NEGOTIATION
+  WON
+  LOST
+}
+
+model Deal {
+  id          String     @id @default(cuid())
+  companyId   String
+  company     Company    @relation(fields: [companyId], references: [id])
+  leadId      String?    @unique
+  lead        Lead?      @relation(fields: [leadId], references: [id])
+  clientId    String?
+  client      Client?    @relation(fields: [clientId], references: [id])
+  title       String
+  value       Decimal?   @db.Decimal(12, 2)
+  stage       DealStage  @default(PROSPECTING)
+  ownerId     String
+  owner       User       @relation(fields: [ownerId], references: [id])
+  proposals   Proposal[]
+  contracts   Contract[]
+  closedAt    DateTime?
+  createdAt   DateTime   @default(now())
+}
+
+model FollowUp {
+  id        String   @id @default(cuid())
+  leadId    String
+  lead      Lead     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  dueDate   DateTime
+  notes     String?
+  completed Boolean  @default(false)
+}
+
+model Proposal {
+  id         String   @id @default(cuid())
+  dealId     String
+  deal       Deal     @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  storageKey String
+  sentAt     DateTime?
+  status     String   @default("draft") // draft | sent | accepted | rejected
+  createdAt  DateTime @default(now())
+}
+
+model Contract {
+  id         String    @id @default(cuid())
+  dealId     String
+  deal       Deal      @relation(fields: [dealId], references: [id], onDelete: Cascade)
+  storageKey String
+  signedAt   DateTime?
+  expiresAt  DateTime?
+}
+
+// ============================================================================
+// 10. FINANCE
+// ============================================================================
+
+enum InvoiceStatus {
+  DRAFT
+  SENT
+  PAID
+  OVERDUE
+  CANCELLED
+}
+
+model Invoice {
+  id          String        @id @default(cuid())
+  companyId   String
+  company     Company       @relation(fields: [companyId], references: [id])
+  clientId    String
+  client      Client        @relation(fields: [clientId], references: [id])
+  projectId   String?
+  project     Project?      @relation(fields: [projectId], references: [id])
+  invoiceNumber String      @unique
+  amount      Decimal       @db.Decimal(12, 2)
+  gstAmount   Decimal?      @db.Decimal(12, 2)
+  status      InvoiceStatus @default(DRAFT)
+  dueDate     DateTime?
+  paidAt      DateTime?
+  createdAt   DateTime      @default(now())
+}
+
+model Expense {
+  id          String   @id @default(cuid())
+  companyId   String
+  company     Company  @relation(fields: [companyId], references: [id])
+  category    String
+  amount      Decimal  @db.Decimal(12, 2)
+  description String?
+  incurredAt  DateTime
+  approvalRequestId String?
+  createdAt   DateTime @default(now())
+}
+
+model Payroll {
+  id         String   @id @default(cuid())
+  userId     String
+  month      Int
+  year       Int
+  grossAmount Decimal @db.Decimal(12, 2)
+  deductions Decimal  @default(0) @db.Decimal(12, 2)
+  netAmount  Decimal  @db.Decimal(12, 2)
+  paidAt     DateTime?
+
+  @@unique([userId, month, year])
+}
+
+// ============================================================================
+// 11. HR
+// ============================================================================
+
+enum LeaveType {
+  SICK
+  CASUAL
+  EARNED
+  UNPAID
+  MATERNITY
+  PATERNITY
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+model LeaveRequest {
+  id        String      @id @default(cuid())
+  userId    String
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      LeaveType
+  startDate DateTime
+  endDate   DateTime
+  reason    String?
+  status    LeaveStatus @default(PENDING)
+  approvedById String?
+  approvalRequestId String? // routed through ApprovalRequest per ApprovalPolicy for LEAVE
+  createdAt DateTime    @default(now())
+}
+
+model LeaveBalance {
+  id        String @id @default(cuid())
+  userId    String @unique
+  user      User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sick      Float  @default(0)
+  casual    Float  @default(0)
+  earned    Float  @default(0)
+  updatedAt DateTime @updatedAt
+}
+
+model Holiday {
+  id        String   @id @default(cuid())
+  companyId String
+  company   Company  @relation(fields: [companyId], references: [id])
+  name      String
+  date      DateTime @db.Date
+}
+
+model PerformanceReview {
+  id         String   @id @default(cuid())
+  subjectId  String
+  subject    User     @relation("ReviewSubject", fields: [subjectId], references: [id], onDelete: Cascade)
+  authorId   String
+  author     User     @relation("ReviewAuthor", fields: [authorId], references: [id])
+  periodStart DateTime
+  periodEnd   DateTime
+  rating     Int? // 1-5
+  strengths  String?
+  improvements String?
+  createdAt  DateTime @default(now())
+}
+
+model PromotionRequest {
+  id          String   @id @default(cuid())
+  userId      String
+  requestedById String
+  currentTitle String
+  proposedTitle String
+  justification String?
+  status      String   @default("pending") // pending | approved | rejected
+  approvalRequestId String?
+  createdAt   DateTime @default(now())
+}
+
+model ExitProcess {
+  id            String    @id @default(cuid())
+  userId        String    @unique
+  resignationDate DateTime
+  lastWorkingDay  DateTime?
+  exitInterviewDone Boolean @default(false)
+  assetsReturned    Boolean @default(false)
+  finalSettlementDone Boolean @default(false)
+  status        String    @default("in_progress") // in_progress | completed
+}
+
+// ============================================================================
+// 12. KNOWLEDGE BASE
+// ============================================================================
+
+model KnowledgeBaseArticle {
+  id        String   @id @default(cuid())
+  companyId String
+  company   Company  @relation(fields: [companyId], references: [id])
+  title     String
+  category  String // "SOP" | "Coding Standards" | "API Docs" | "Design Guidelines" | "Meeting Notes"
+  content   String // markdown
+  tags      String[]
+  createdById String
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+}
+
+model TrainingVideo {
+  id          String   @id @default(cuid())
+  title       String
+  description String?
+  storageKey  String
+  durationSeconds Int?
+  createdAt   DateTime @default(now())
+}
+
+// ============================================================================
+// 13. COMMUNICATION
+// ============================================================================
+
+enum ChannelType {
+  COMPANY
+  TEAM
+  DIRECT
+  CLIENT
+}
+
+model ChatChannel {
+  id        String        @id @default(cuid())
+  companyId String
+  company   Company       @relation(fields: [companyId], references: [id])
+  type      ChannelType
+  name      String?
+  teamId    String?
+  messages  ChatMessage[]
+  createdAt DateTime      @default(now())
+}
+
+model ChatMessage {
+  id         String      @id @default(cuid())
+  channelId  String
+  channel    ChatChannel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  senderUserId String?
+  sender     User?       @relation(fields: [senderUserId], references: [id])
+  senderClientId String?
+  senderClient Client?   @relation(fields: [senderClientId], references: [id])
+  body       String?
+  attachmentUrl String?
+  createdAt  DateTime    @default(now())
+}
+
+model Meeting {
+  id           String            @id @default(cuid())
+  title        String
+  organizerId  String
+  organizer    User              @relation("MeetingOrganizer", fields: [organizerId], references: [id])
+  scheduledAt  DateTime
+  durationMinutes Int            @default(30)
+  meetingLink  String?
+  attendees    MeetingAttendee[]
+  createdAt    DateTime          @default(now())
+}
+
+model MeetingAttendee {
+  id        String   @id @default(cuid())
+  meetingId String
+  meeting   Meeting  @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  attended  Boolean?
+
+  @@unique([meetingId, userId])
+}
+
+model Announcement {
+  id        String   @id @default(cuid())
+  companyId String
+  company   Company  @relation(fields: [companyId], references: [id])
+  title     String
+  body      String
+  postedById String
+  audience  String   @default("company") // company | team:{id}
+  createdAt DateTime @default(now())
+}
+
+// ============================================================================
+// 14. NOTIFICATIONS
+// ============================================================================
+
+enum NotificationType {
+  TASK
+  MEETING
+  ANNOUNCEMENT
+  MENTION
+  SYSTEM
+  POINTS
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+  PUSH
+  SLACK // future
+  WHATSAPP // future
+}
+
+model Notification {
+  id        String            @id @default(cuid())
+  userId    String
+  user      User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      NotificationType
+  title     String
+  body      String?
+  linkUrl   String?
+  channels  NotificationChannel[] // which channels this notification was (or should be) sent on
+  readAt    DateTime?
+  createdAt DateTime          @default(now())
+}
+
+// Per-user, per-type channel opt-in/out. Absence of a row = use
+// Company.notificationDefaults.
+model NotificationPreference {
+  id       String              @id @default(cuid())
+  userId   String
+  type     NotificationType
+  channel  NotificationChannel
+  enabled  Boolean             @default(true)
+
+  @@unique([userId, type, channel])
+}
+
+// ============================================================================
+// 15. APPROVAL ENGINE
+// ============================================================================
+// One generic, reusable approval workflow instead of bespoke approve/reject
+// logic per module. LeaveRequest, Expense, Timesheet, PurchaseRequest, and
+// PromotionRequest each optionally hold an `approvalRequestId` pointing here;
+// the engine itself doesn't need to know what it's approving.
+
+enum ApprovalType {
+  LEAVE
+  EXPENSE
+  TIMESHEET
+  PURCHASE
+  PROMOTION
+  SALARY_CHANGE
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+model ApprovalRequest {
+  id               String         @id @default(cuid())
+  type             ApprovalType
+  entityType       String // "LeaveRequest", "Expense", etc. — for generic lookups
+  entityId         String
+  requestedById    String
+  status           ApprovalStatus @default(PENDING)
+  currentStepOrder Int            @default(1)
+  steps            ApprovalStep[]
+  createdAt        DateTime       @default(now())
+  resolvedAt       DateTime?
+}
+
+model ApprovalStep {
+  id                String          @id @default(cuid())
+  approvalRequestId String
+  approvalRequest   ApprovalRequest @relation(fields: [approvalRequestId], references: [id], onDelete: Cascade)
+  stepOrder         Int // 1, 2, 3... sequential chain (e.g. Team Lead -> Finance -> Company Admin)
+  approverId        String
+  status            ApprovalStatus  @default(PENDING)
+  comment           String?
+  actedAt           DateTime?
+
+  @@unique([approvalRequestId, stepOrder])
+}
+
+// A reusable definition of "who approves this type of request, in what
+// order" — e.g. LEAVE: [Team Lead, HR Manager]. Interpreted by the service
+// layer when a new ApprovalRequest of a given type is created.
+model ApprovalPolicy {
+  id           String       @id @default(cuid())
+  companyId    String
+  type         ApprovalType
+  approverRoleChain RoleName[] // ordered list of roles, one approver per step
+
+  @@unique([companyId, type])
+}
+
+model Timesheet {
+  id                String          @id @default(cuid())
+  userId            String
+  weekStartDate     DateTime        @db.Date
+  totalHours        Float
+  approvalRequestId String?
+  submittedAt       DateTime        @default(now())
+
+  @@unique([userId, weekStartDate])
+}
+
+model PurchaseRequest {
+  id                String   @id @default(cuid())
+  requestedById     String
+  itemDescription   String
+  estimatedCost     Decimal  @db.Decimal(12, 2)
+  vendor            String?
+  approvalRequestId String?
+  createdAt         DateTime @default(now())
+}
+
+// ============================================================================
+// 16. ADMIN ANALYTICS
+// ============================================================================
+// Most CEO-dashboard metrics (active employees, revenue, task completion
+// rate, etc.) are computed via aggregate queries across the models above
+// rather than stored redundantly. A nightly job can materialize expensive
+// aggregates into a snapshot table if query performance becomes an issue:
+
+model DailyMetricSnapshot {
+  id                 String   @id @default(cuid())
+  date               DateTime @db.Date @unique
+  activeEmployees    Int
+  activeProjects     Int
+  monthRevenue       Decimal  @db.Decimal(12, 2)
+  newLeads           Int
+  taskCompletionRate Float // 0-1
+  cashFlow           Decimal  @db.Decimal(12, 2)
+  createdAt          DateTime @default(now())
+}
+
+// ============================================================================
+// 17. DASHBOARD PREFERENCES
+// ============================================================================
+// Which widgets a role sees by default (Super Admin's CEO dashboard vs a
+// Developer's task-focused view) is a frontend concern driven off Role +
+// Permission — no schema needed for that part. This table only stores each
+// user's personal customization (reordering, hiding a widget) on top of
+// their role's default layout.
+
+model DashboardWidgetPreference {
+  id        String  @id @default(cuid())
+  userId    String
+  widgetKey String // e.g. "todays_tasks", "revenue_chart", "team_leaderboard"
+  visible   Boolean @default(true)
+  order     Int     @default(0)
+
+  @@unique([userId, widgetKey])
+}
